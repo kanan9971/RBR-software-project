@@ -1,23 +1,21 @@
 #include <Arduino.h>
 
+// Pin definitions (using direct PIN_PCx as suggested)
+#define APPS_5V_PIN   PIN_PC0  // Analog input for 5V APPS
+#define APPS_3V3_PIN  PIN_PC1  // Analog input for 3.3V APPS
+#define BRAKE_PIN     PIN_PC3  // Analog input for brake
+#define START_BUTTON_PIN PIN_PC4  // Digital input (active LOW)
+#define BRAKE_LIGHT_PIN  PIN_PD2  // Digital output
+#define DRIVE_LED_PIN    PIN_PD3  // Digital output
+#define BUZZER_PIN       PIN_PD4  // Digital output (corrected from PD5 in your code, per project PDF)
 
-// Pin definitions (based on project drawing: start button on PC4 = A4, buzzer on PD5 = 5)
-#define APPS_5V_PIN A0    // PC0 (analog)
-#define APPS_3V3_PIN A1   // PC1 (analog)
-#define BRAKE_PIN A3      // PC3 (analog)
-#define START_BUTTON_PIN A4  // PC4 (digital, use A4 for analog pin as digital)
-#define BRAKE_LIGHT_PIN 2    // PD2 (digital)
-#define DRIVE_LED_PIN 3      // PD3 (digital)
-#define BUZZER_PIN 5         // PD5 (digital)
-
-// Thresholds (adjust based on hardware/testing; brake > this = depressed)
-const int BRAKE_THRESHOLD = 200;  // 0-1023 scale
-const int APPS_FAULT_THRESHOLD_PCT = 10;  // 10% difference for fault
-const unsigned long STARTIN_HOLD_TIME = 2000;  // 2 seconds
-const unsigned long BUZZIN_TIME = 2000;        // 2 seconds
-const unsigned long APPS_FAULT_TIME = 100;     // 100ms for persistent fault
-
-const bool MOTOR_REVERSE = false;  // True to flip motor direction (negative torque)
+// Thresholds and constants (using unsigned types)
+const uint16_t BRAKE_THRESHOLD = 200;  // 0-1023 scale, brake depressed if > this
+const uint16_t APPS_FAULT_THRESHOLD = 102;  // Absolute diff for 10% fault (≈10% of 1023)
+const uint32_t STARTIN_HOLD_TIME = 2000UL;  // 2 seconds
+const uint32_t BUZZIN_TIME = 2000UL;        // 2 seconds
+const uint32_t APPS_FAULT_TIME = 100UL;     // 100ms for persistent fault
+const bool MOTOR_REVERSE = false;           // True to flip motor direction (negative torque)
 
 // States enum
 enum CarState {
@@ -29,14 +27,58 @@ enum CarState {
 
 // Global variables
 CarState currentState = INIT;
-unsigned long stateStartTime = 0;  // For state transition timing
-unsigned long faultStartTime = 0;  // For APPS fault timing
+uint32_t stateStartTime = 0;  // For state transition timing
+uint32_t faultStartTime = 0;  // For APPS fault timing
 bool isFaulty = false;
-int16_t motorTorque = 0;  // Calculated torque (-32768 to 32767)
+int16_t motorTorque = 0;      // Calculated torque (-32768 to 32767)
+
+// Function to check for pedal fault (returns true if persistent fault detected)
+bool checkPedalFault(uint16_t apps5v, uint16_t apps3v3) {
+  // Scale APPS_3V3 to 0-1023 range using integer math (50/33 ≈ 5/3.3)
+  uint16_t scaled_apps3v3 = (static_cast<uint32_t>(apps3v3) * 50UL) / 33UL;
+
+  // Calculate absolute difference
+  uint16_t diff = (apps5v > scaled_apps3v3) ? (apps5v - scaled_apps3v3) : (scaled_apps3v3 - apps5v);
+
+  if (diff > APPS_FAULT_THRESHOLD) {
+    if (!isFaulty) {
+      faultStartTime = millis();
+      isFaulty = true;
+    }
+    // Check if fault persists > 100ms
+    if (millis() - faultStartTime >= APPS_FAULT_TIME) {
+      return true;  // Persistent fault
+    }
+  } else {
+    isFaulty = false;
+  }
+  return false;  // No persistent fault
+}
+
+// Function to calculate torque from pedal readings (assumes no fault)
+int16_t calculateTorque(uint16_t apps5v, uint16_t apps3v3) {
+  // Scale APPS_3V3 to 0-1023 range
+  uint16_t scaled_apps3v3 = (static_cast<uint32_t>(apps3v3) * 50UL) / 33UL;
+
+  // Average the two APPS readings
+  uint32_t avg_apps = (static_cast<uint32_t>(apps5v) + static_cast<uint32_t>(scaled_apps3v3)) / 2UL;
+
+  // Map to torque (0 to 32767) using integer math
+  int16_t torque = static_cast<int16_t>((avg_apps * 32767LL) / 1023LL);
+
+  // Reverse if needed
+  if (MOTOR_REVERSE) {
+    torque = -torque;
+  }
+  return torque;
+}
 
 void setup() {
-  // Set pin modes
-  pinMode(START_BUTTON_PIN, INPUT_PULLUP);  // Pullup for active LOW button
+  // Set pin modes (explicit for analogs, as per feedback)
+  pinMode(APPS_5V_PIN, INPUT);
+  pinMode(APPS_3V3_PIN, INPUT);
+  pinMode(BRAKE_PIN, INPUT);
+  pinMode(START_BUTTON_PIN, INPUT_PULLUP);  // Active LOW; could use INPUT if external pullup
   pinMode(BRAKE_LIGHT_PIN, OUTPUT);
   pinMode(DRIVE_LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
@@ -51,10 +93,10 @@ void setup() {
 
 void loop() {
   // Read inputs every loop
-  int apps5v = analogRead(APPS_5V_PIN);     // 0-1023
-  int apps3v3 = analogRead(APPS_3V3_PIN);   // 0-~675 (3.3V max)
-  int brake = analogRead(BRAKE_PIN);        // 0-1023
-  bool startButtonPressed = (digitalRead(START_BUTTON_PIN) == LOW);  // Assume LOW = pressed
+  uint16_t apps5v = analogRead(APPS_5V_PIN);    // 0-1023
+  uint16_t apps3v3 = analogRead(APPS_3V3_PIN);  // 0-~675 (3.3V max)
+  uint16_t brake = analogRead(BRAKE_PIN);       // 0-1023
+  bool startButtonPressed = (digitalRead(START_BUTTON_PIN) == LOW);  // Active LOW
 
   // Always handle brake light (in all states)
   digitalWrite(BRAKE_LIGHT_PIN, (brake > BRAKE_THRESHOLD) ? HIGH : LOW);
@@ -109,48 +151,15 @@ void loop() {
       digitalWrite(DRIVE_LED_PIN, HIGH);  // LED on
       digitalWrite(BUZZER_PIN, LOW);
 
-      // Scale APPS_3V3 to match 5V range (0-1023 equivalent)
-      float scaledApps3v3 = apps3v3 * (5.0 / 3.3);
-
-      // Check fault: difference >10% of full scale (1023)
-      float diff = abs(apps5v - scaledApps3v3);
-      float faultThreshold = (APPS_FAULT_THRESHOLD_PCT / 100.0) * 1023.0;
-
-      if (diff > faultThreshold) {
-        if (!isFaulty) {
-          faultStartTime = millis();
-          isFaulty = true;
-        }
-        // If persistent >100ms, fault out to INIT
-        if (millis() - faultStartTime >= APPS_FAULT_TIME) {
-          motorTorque = 0;
-          currentState = INIT;
-          stateStartTime = millis();
-          isFaulty = false;
-          break;
-        }
-      } else {
-        isFaulty = false;  // Reset fault
-      }
-
-      // Calculate torque (only if no fault)
-      if (!isFaulty) {
-        // Average scaled APPS and normalize to 0-1
-        float avgApps = (apps5v + scaledApps3v3) / 2.0;
-        float normalized = avgApps / 1023.0;
-
-        // Scale to torque range (0 to 32767 forward)
-        motorTorque = (int16_t)(normalized * 32767.0);
-
-        // Flip to negative if MOTOR_REVERSE is true
-        if (MOTOR_REVERSE) {
-          motorTorque = -motorTorque;  // -32768 to 0
-        }
-      } else {
+      // Check for pedal fault and update torque
+      if (checkPedalFault(apps5v, apps3v3)) {
         motorTorque = 0;
+        currentState = INIT;
+        stateStartTime = millis();
+        isFaulty = false;
+      } else {
+        motorTorque = calculateTorque(apps5v, apps3v3);
       }
       break;
   }
 }
-
-  
